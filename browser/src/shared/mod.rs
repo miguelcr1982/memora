@@ -50,7 +50,7 @@ pub fn run_main(main_args: &MainArgs, cmd_line: &CommandLine, sandbox_info: *mut
         return;
     }
 
-    let mut app = simple_app::SimpleApp::new();
+    let mut app = simple_app::MemoraApp::new();
 
     let settings = Settings {
         no_sandbox: !cfg!(feature = "sandbox") as _,

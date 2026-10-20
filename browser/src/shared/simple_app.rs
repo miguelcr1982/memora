@@ -97,7 +97,7 @@ wrap_browser_view_delegate! {
 }
 
 wrap_app! {
-    pub struct SimpleApp;
+    pub struct MemoraApp;
 
     impl App {
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
