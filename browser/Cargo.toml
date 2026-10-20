@@ -1,0 +1,46 @@
+[package]
+name = "memora-browser"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "memora-browser"
+
+[[bin]]
+name = "cefsimple_helper"
+
+[features]
+default = []
+
+sandbox = [
+    "cef/sandbox",
+]
+
+[package.metadata.cef.bundle]
+helper_name = "cefsimple_helper"
+resources_path = "resources"
+
+[dependencies]
+cef = {
+    version = "154.5.0",
+    default-features = false,
+    features = ["build-util"]
+}
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = {
+    version = "0.61",
+    features = [
+        "Win32_Foundation",
+        "Win32_UI_WindowsAndMessaging",
+    ]
+}
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winres = "0.1"
+
+[workspace]
