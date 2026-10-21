@@ -135,6 +135,21 @@ impl SimpleHandler {
     ) {
         debug_assert_ne!(currently_on(ThreadId::UI), 0);
 
+        let error_text_log = error_text
+            .map(CefString::to_string)
+            .unwrap_or_default();
+
+        let failed_url_log = failed_url
+            .map(CefString::to_string)
+            .unwrap_or_default();
+
+        println!(
+            "[Memora] Load error\n  URL:   {}\n  Code:  {:?}\n  Error: {}",
+            failed_url_log,
+            error_code,
+            error_text_log
+        );
+
         // Allow Chrome to show the error page.
         if !self.is_alloy_style {
             return;
@@ -337,5 +352,227 @@ wrap_request_handler! {
     }
 
     impl RequestHandler {
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _is_navigation: i32,
+            _is_download: i32,
+            _request_initiator: Option<&CefString>,
+            disable_default_handling: Option<&mut i32>,
+        ) -> Option<ResourceRequestHandler> {
+            let Some(request) = request else {
+                return None;
+            };
+
+            let url = request.url();
+            let url = CefString::from(&url).to_string();
+
+            println!(
+                "[Memora] Resource request: {}",
+                url
+            );
+
+            if let Some(disable) = disable_default_handling {
+                *disable = 0;
+            }
+
+            Some(
+                SimpleResourceRequestHandler::new(
+                    self.inner.clone(),
+                    Arc::new(Mutex::new(Vec::new())),
+                )
+            )
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct SimpleResourceRequestHandler {
+        inner: Arc<Mutex<SimpleHandler>>,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl ResourceRequestHandler {
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            if let Some(request) = request {
+                let url = request.url();
+                let url = CefString::from(&url).to_string();
+
+                println!(
+                    "[Memora] Continuing resource: {}",
+                    url
+                );
+            }
+
+            ReturnValue::CONTINUE
+        }
+
+        fn on_resource_response(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            response: Option<&mut Response>,
+        ) -> i32 {
+            let url = request
+                .map(|request| {
+                    let url = request.url();
+                    CefString::from(&url).to_string()
+                })
+                .unwrap_or_default();
+
+            let Some(response) = response else {
+                println!(
+                    "[Memora] Response without metadata: {}",
+                    url
+                );
+
+                return 0;
+            };
+
+            let status = response.status();
+
+            let mime_raw = response.mime_type();
+            let mime_type =
+                CefString::from(&mime_raw).to_string();
+
+            println!(
+                "[Memora] Response\n  URL:    {}\n  MIME:   {}\n  Status: {}",
+                url,
+                mime_type,
+                status
+            );
+
+            0
+        }
+
+        fn resource_response_filter(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _response: Option<&mut Response>,
+        ) -> Option<ResponseFilter> {
+            let url = request
+                .map(|request| {
+                    let url = request.url();
+                    CefString::from(&url).to_string()
+                })
+                .unwrap_or_default();
+
+            println!(
+                "[Memora] Installing response filter: {}",
+                url
+            );
+
+            Some(
+                MemoraResponseFilter::new(
+                    self.captured.clone()
+                )
+            )
+        }
+
+        fn on_resource_load_complete(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _response: Option<&mut Response>,
+            status: UrlrequestStatus,
+            received_content_length: i64,
+        ) {
+            let url = request
+                .map(|request| {
+                    let url = request.url();
+                    CefString::from(&url).to_string()
+                })
+                .unwrap_or_default();
+
+            println!(
+                "[Memora] Resource complete\n  URL:    {}\n  Status: {:?}\n  Bytes:  {}",
+                url,
+                status,
+                received_content_length
+            );
+
+            let captured_len = self
+                .captured
+                .lock()
+                .map(|captured| captured.len())
+                .unwrap_or(0);
+
+            println!(
+                "[Memora] Captured bytes: {}",
+                captured_len
+            );
+        }
+    }
+}
+
+wrap_response_filter! {
+    struct MemoraResponseFilter {
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl ResponseFilter {
+        fn init_filter(&self) -> i32 {
+            1
+        }
+
+        fn filter(
+            &self,
+            data_in: Option<&mut Vec<u8>>,
+            data_in_read: Option<&mut usize>,
+            data_out: Option<&mut Vec<u8>>,
+            data_out_written: Option<&mut usize>,
+        ) -> ResponseFilterStatus {
+            let Some(data_in) = data_in else {
+                return ResponseFilterStatus::DONE;
+            };
+
+            let Some(data_out) = data_out else {
+                return ResponseFilterStatus::ERROR;
+            };
+
+            let count = data_in.len().min(data_out.len());
+
+            if count == 0 {
+                if let Some(read) = data_in_read {
+                    *read = 0;
+                }
+
+                if let Some(written) = data_out_written {
+                    *written = 0;
+                }
+
+                return ResponseFilterStatus::NEED_MORE_DATA;
+            }
+
+            // Guardamos una copia para Memora.
+            if let Ok(mut captured) = self.captured.lock() {
+                captured.extend_from_slice(&data_in[..count]);
+            }
+
+            // Dejamos pasar exactamente los mismos bytes a Chromium.
+            data_out[..count].copy_from_slice(&data_in[..count]);
+
+            if let Some(read) = data_in_read {
+                *read = count;
+            }
+
+            if let Some(written) = data_out_written {
+                *written = count;
+            }
+
+            ResponseFilterStatus::NEED_MORE_DATA
+        }
     }
 }
