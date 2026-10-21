@@ -28,6 +28,24 @@ fn platform_show_window(_browser: Option<&mut Browser>) {
     todo!("Implement platform_show_window for non-macOS platforms");
 }
 
+fn format_memory_bytes(bytes: usize) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let value = bytes as f64;
+
+    if value >= GIB {
+        format!("{:.2} GiB", value / GIB)
+    } else if value >= MIB {
+        format!("{:.2} MiB", value / MIB)
+    } else if value >= KIB {
+        format!("{:.2} KiB", value / KIB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 static SIMPLE_HANDLER_INSTANCE: OnceLock<Weak<Mutex<SimpleHandler>>> = OnceLock::new();
 
 pub struct SimpleHandler {
@@ -56,7 +74,13 @@ impl SimpleHandler {
                 browser_list: Vec::new(),
                 is_closing: false,
                 weak_self: weak.clone(),
-                memory_manager: Arc::new(Mutex::new(MemoryManager::new())),
+                memory_manager: Arc::new(
+                    Mutex::new(
+                        MemoryManager::new(
+                            crate::memory::MemoryMode::Lz4
+                        )
+                    )
+                ),
             })
         })
     }
@@ -545,8 +569,6 @@ wrap_resource_request_handler! {
                 url.clone()
             };
 
-            
-
             let captured_len = self
                 .captured
                 .lock()
@@ -581,20 +603,35 @@ wrap_resource_request_handler! {
                         .map(|status| *status)
                         .unwrap_or(0);
 
-                    let resource = MemoryResource {
-                        url: url.clone(),
+                    let resource = MemoryResource::new(
+                        "browser",
+                        url.clone(),
                         mime_type,
-                        status: status_code,
+                        status_code,
                         body,
-                    };
+                    );
 
                     if let Ok(mut manager) = self.memory_manager.lock() {
-                        manager.store(resource);
+                        match manager.store(resource) {
+                            Ok(stats) => {
+                                println!(
+                                    "[Memora] Stored | Resources: {} | Blocks: {} unique / {} logical | Duplicates: {} | Logical: {} | Physical: {}",
+                                    stats.resources,
+                                    stats.unique_blocks,
+                                    stats.logical_blocks,
+                                    stats.duplicate_blocks,
+                                    format_memory_bytes(stats.logical_bytes),
+                                    format_memory_bytes(stats.physical_bytes),
+                                );
+                            }
 
-                        println!(
-                            "[Memora] Stored | Resources: {}",
-                            manager.len()
-                        );
+                            Err(error) => {
+                                eprintln!(
+                                    "[Memora] Memory store failed: {}",
+                                    error
+                                );
+                            }
+                        }
                     }
                 }
             }
