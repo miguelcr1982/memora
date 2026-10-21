@@ -1,5 +1,6 @@
 use cef::*;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
+use crate::memory::{MemoryManager, MemoryResource};
 
 fn get_data_uri(data: &[u8], mime_type: &str) -> String {
     let data = CefString::from(&base64_encode(Some(data)));
@@ -34,6 +35,7 @@ pub struct SimpleHandler {
     browser_list: Vec<Browser>,
     is_closing: bool,
     weak_self: Weak<Mutex<Self>>,
+    memory_manager: Arc<Mutex<MemoryManager>>,
 }
 
 impl SimpleHandler {
@@ -54,6 +56,7 @@ impl SimpleHandler {
                 browser_list: Vec::new(),
                 is_closing: false,
                 weak_self: weak.clone(),
+                memory_manager: Arc::new(Mutex::new(MemoryManager::new())),
             })
         })
     }
@@ -369,19 +372,33 @@ wrap_request_handler! {
             let url = request.url();
             let url = CefString::from(&url).to_string();
 
+            let display_url = if url.len() > 60 {
+                format!("{}...", &url[..60])
+            } else {
+                url.clone()
+            };
+
             println!(
                 "[Memora] Resource request: {}",
-                url
+                display_url
             );
 
             if let Some(disable) = disable_default_handling {
                 *disable = 0;
             }
 
+            let memory_manager = {
+                let inner = self.inner.lock().expect("Failed to lock inner");
+                inner.memory_manager.clone()
+            };
+
             Some(
                 SimpleResourceRequestHandler::new(
                     self.inner.clone(),
                     Arc::new(Mutex::new(Vec::new())),
+                    Arc::new(Mutex::new(String::new())),
+                    Arc::new(Mutex::new(0)),
+                    memory_manager,
                 )
             )
         }
@@ -392,6 +409,9 @@ wrap_resource_request_handler! {
     struct SimpleResourceRequestHandler {
         inner: Arc<Mutex<SimpleHandler>>,
         captured: Arc<Mutex<Vec<u8>>>,
+        mime_type: Arc<Mutex<String>>,
+        status_code: Arc<Mutex<i32>>,
+        memory_manager: Arc<Mutex<MemoryManager>>,
     }
 
     impl ResourceRequestHandler {
@@ -406,10 +426,13 @@ wrap_resource_request_handler! {
                 let url = request.url();
                 let url = CefString::from(&url).to_string();
 
-                println!(
-                    "[Memora] Continuing resource: {}",
-                    url
-                );
+                let display_url = if url.len() > 60 {
+                    format!("{}...", &url[..60])
+                } else {
+                    url.clone()
+                };
+
+                println!("[Memora] Continuing: {}", display_url);
             }
 
             ReturnValue::CONTINUE
@@ -428,11 +451,17 @@ wrap_resource_request_handler! {
                     CefString::from(&url).to_string()
                 })
                 .unwrap_or_default();
+            
+            let display_url = if url.len() > 60 {
+                format!("{}...", &url[..60])
+            } else {
+                url.clone()
+            };
 
             let Some(response) = response else {
                 println!(
                     "[Memora] Response without metadata: {}",
-                    url
+                    display_url
                 );
 
                 return 0;
@@ -444,11 +473,19 @@ wrap_resource_request_handler! {
             let mime_type =
                 CefString::from(&mime_raw).to_string();
 
+            if let Ok(mut stored_mime) = self.mime_type.lock() {
+                *stored_mime = mime_type.clone();
+            }
+
+            if let Ok(mut stored_status) = self.status_code.lock() {
+                *stored_status = status;
+            }
+
             println!(
-                "[Memora] Response\n  URL:    {}\n  MIME:   {}\n  Status: {}",
-                url,
+                "[Memora] Response | Status: {} | MIME: {} | URL: {}",
+                status,
                 mime_type,
-                status
+                display_url
             );
 
             0
@@ -468,9 +505,15 @@ wrap_resource_request_handler! {
                 })
                 .unwrap_or_default();
 
+            let display_url = if url.len() > 60 {
+                format!("{}...", &url[..60])
+            } else {
+                url.clone()
+            };
+
             println!(
-                "[Memora] Installing response filter: {}",
-                url
+                "[Memora] Filter: {}",
+                display_url
             );
 
             Some(
@@ -496,12 +539,13 @@ wrap_resource_request_handler! {
                 })
                 .unwrap_or_default();
 
-            println!(
-                "[Memora] Resource complete\n  URL:    {}\n  Status: {:?}\n  Bytes:  {}",
-                url,
-                status,
-                received_content_length
-            );
+            let display_url = if url.len() > 60 {
+                format!("{}...", &url[..60])
+            } else {
+                url.clone()
+            };
+
+            
 
             let captured_len = self
                 .captured
@@ -510,9 +554,50 @@ wrap_resource_request_handler! {
                 .unwrap_or(0);
 
             println!(
-                "[Memora] Captured bytes: {}",
-                captured_len
+                "[Memora] Complete | Status: {:?} | Bytes: {} | Captured: {} | URL: {}",
+                status,
+                received_content_length,
+                captured_len,
+                display_url
             );
+
+            if status == UrlrequestStatus::SUCCESS {
+                let body = self
+                    .captured
+                    .lock()
+                    .map(|captured| captured.clone())
+                    .unwrap_or_default();
+
+                if !body.is_empty() {
+                    let mime_type = self
+                        .mime_type
+                        .lock()
+                        .map(|mime| mime.clone())
+                        .unwrap_or_default();
+
+                    let status_code = self
+                        .status_code
+                        .lock()
+                        .map(|status| *status)
+                        .unwrap_or(0);
+
+                    let resource = MemoryResource {
+                        url: url.clone(),
+                        mime_type,
+                        status: status_code,
+                        body,
+                    };
+
+                    if let Ok(mut manager) = self.memory_manager.lock() {
+                        manager.store(resource);
+
+                        println!(
+                            "[Memora] Stored | Resources: {}",
+                            manager.len()
+                        );
+                    }
+                }
+            }
         }
     }
 }
