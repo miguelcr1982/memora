@@ -235,6 +235,12 @@ wrap_client! {
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(SimpleHandlerLoadHandler::new(self.inner.clone()))
         }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(SimpleHandlerRequestHandler::new(
+                self.inner.clone()
+            ))
+        }
     }
 }
 
@@ -322,5 +328,14 @@ wrap_task! {
             let mut inner = self.inner.lock().expect("Failed to lock inner");
             inner.close_all_browsers(self.force_close);
         }
+    }
+}
+
+wrap_request_handler! {
+    struct SimpleHandlerRequestHandler {
+        inner: Arc<Mutex<SimpleHandler>>,
+    }
+
+    impl RequestHandler {
     }
 }
