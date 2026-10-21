@@ -1,855 +1,941 @@
 # Monster Memory Engine 👹
 
-An experimental memory manager written in Rust that explores **cross-workspace deduplication** and **user-selectable in-memory compression** for web browser resources.
+Motor experimental de gestión de memoria escrito en Rust que explora la **deduplicación entre espacios de trabajo** y la **compresión en memoria de recursos web**.
 
-The long-term goal is to investigate whether Chromium-based browsers can reduce memory usage by combining:
+El proyecto incluye actualmente:
 
-- Content deduplication
-- Shared immutable resources across isolated workspaces
-- LZ4 or Zstd in-memory compression
-- Hot / warm / cold resource tracking
-- On-demand decompression
-- Independent workspace isolation
+- Motor de memoria basado en bloques de 64 KiB.
+- Deduplicación mediante BLAKE3.
+- Verificación byte a byte antes de reutilizar bloques.
+- Seguimiento de referencias.
+- Estados lógicos HOT, WARM y COLD.
+- Almacenamiento RAW.
+- Compresión LZ4.
+- Soporte para compresión Zstd.
+- Detección de bloques que no se benefician de la compresión.
+- Integración experimental con CEF 154.
+- Captura en vivo de respuestas HTTP mediante `ResponseFilter`.
+- Métricas en tiempo real de bloques lógicos, únicos, duplicados y memoria física administrada.
 
 > [!IMPORTANT]
-> This project is currently a proof of concept.
+> Monster Memory Engine sigue siendo una prueba de concepto.
 >
-> It is **not yet integrated with Chromium**, and the memory savings shown below refer to the web-resource dataset processed by the prototype, not total browser process memory.
+> El proyecto ya incluye una integración experimental con CEF 154 escrita en Rust. Las respuestas HTTP se interceptan mediante un `ResponseFilter` transparente y se envían al motor de memoria.
+>
+> Las métricas físicas mostradas por Memora corresponden únicamente a los recursos almacenados por su gestor. No representan el consumo total de memoria de Chromium o CEF.
 
-> This is a **human-driven, AI-assisted** experimental project. Generative AI has been used during architecture exploration, Rust prototyping, refactoring, benchmarking discussions, and documentation. Technical decisions, execution, testing, and validation remain human-driven.
+Este es un proyecto experimental **dirigido por una persona y asistido por inteligencia artificial**.
+
+La inteligencia artificial se ha utilizado durante:
+
+- Exploración de arquitectura.
+- Creación de prototipos en Rust.
+- Refactorización.
+- Análisis de resultados.
+- Diseño de pruebas.
+- Depuración.
+- Documentación.
+
+Las decisiones técnicas, ejecución, pruebas y validación siguen siendo responsabilidad humana.
 
 ---
 
-## Why?
+## Objetivo
 
-Modern browsers isolate tabs, sites, and renderer processes for good reasons: security, stability, and fault isolation.
+Los navegadores modernos aíslan pestañas, sitios y procesos de renderizado por motivos de seguridad, estabilidad y tolerancia a fallos.
 
-However, multiple browser workspaces may load identical resources such as:
+Sin embargo, diferentes pestañas o espacios de trabajo pueden cargar recursos idénticos:
 
-- JavaScript bundles
-- CSS
-- Fonts
-- Images
-- JSON
-- HTML
-- WebAssembly
+- JavaScript.
+- CSS.
+- HTML.
+- JSON.
+- Imágenes.
+- Fuentes.
+- WebAssembly.
+- Otros recursos inmutables.
 
-Monster Memory Engine explores a simple question:
+Monster Memory Engine investiga dos preguntas principales:
 
-> Can isolated browser workspaces share identical immutable resources while their private execution state remains isolated?
+> ¿Pueden diferentes espacios de trabajo reutilizar físicamente recursos idénticos sin perder su aislamiento lógico?
 
-The second question is:
+> ¿Pueden los recursos inactivos mantenerse comprimidos en memoria y restaurarse cuando vuelvan a utilizarse?
 
-> Can inactive resources remain in compressed RAM and be restored quickly when needed?
-
-Conceptually:
+Modelo conceptual:
 
 ```text
-          Workspace A
-              │
-              ├──────────┐
-              │          │
-          Workspace B    │
-              │          ▼
-              ├──► Shared Resource Store
-              │          │
-          Workspace C    ├── BLAKE3 deduplication
-                         ├── reference tracking
-                         └── compressed storage
+Workspace A ──────────────┐
+                          │
+Workspace B ──────────────┼──► Shared Resource Store
+                          │         │
+Workspace C ──────────────┘         ├── BLAKE3
+                                    ├── deduplicación
+                                    ├── referencias
+                                    └── compresión
 ```
 
-Workspace-specific state remains independent:
+El estado privado continúa aislado:
 
 ```text
 Workspace A
-├── private state
-├── session
+├── sesión
+├── estado privado
 ├── runtime
-└── references ──────┐
+└── referencias ──────────┐
 
-Workspace B          │
-├── private state    │
-├── session          ├──► Shared immutable resources
-├── runtime          │
-└── references ──────┘
+Workspace B               │
+├── sesión                ├──► bloques físicos compartidos
+├── estado privado        │
+├── runtime               │
+└── referencias ──────────┘
 ```
 
 ---
 
-# Memory modes
-
-The user chooses the memory strategy based on the hardware available.
+# Modos de memoria
 
 ## RAM
 
 ```text
-Deduplication: ON
-Compression:   OFF
-Storage:       RAW
+Deduplicación: activada
+Compresión:    desactivada
+Almacenamiento: RAW
 ```
 
-Designed for systems where memory capacity is not a concern and maximum responsiveness is preferred.
+Pensado para sistemas donde la capacidad de memoria no es una preocupación y se busca minimizar el trabajo adicional de CPU.
 
-The shared resource store still performs deduplication.
+La deduplicación continúa activa.
 
 ## LZ4
 
 ```text
-Deduplication: ON
-Compression:   LZ4
+Deduplicación: activada
+Compresión:    LZ4
 ```
 
-Inactive blocks are compressed using LZ4.
+Los bloques inactivos se comprimen cuando la compresión reduce realmente su tamaño.
 
-The goal is to significantly reduce memory consumption while keeping decompression latency low.
+El objetivo es reducir memoria manteniendo una restauración rápida.
 
 ## Zstd
 
 ```text
-Deduplication: ON
-Compression:   Zstd
+Deduplicación: activada
+Compresión:    Zstd
 ```
 
-Designed for systems where memory reduction is more important and additional CPU work is acceptable.
+Pensado para escenarios donde la reducción de memoria tiene mayor prioridad y se acepta un coste adicional de CPU.
 
-The compression level can also be selected.
+El nivel de compresión es configurable.
 
-Example:
+Ejemplo del prototipo original:
 
-```bash
+```powershell
 cargo run --release -- zstd captures 5
 ```
 
 ---
 
-# Architecture
+# Arquitectura del motor
 
 ```text
-                         Web resources
-                              │
-                              ▼
-                       64 KiB blocks
-                              │
-                              ▼
-                         BLAKE3 hash
-                              │
-                              ▼
-                    Byte-level verification
-                              │
-                              ▼
-                  ┌──────────────────────┐
-                  │ Shared Resource Store│
-                  └──────────┬───────────┘
-                             │
-                   Reference tracking
-                             │
-               ┌─────────────┼─────────────┐
-               │             │             │
-              HOT           WARM          COLD
-               │             │             │
-               └─────────────┴─────────────┘
-                             │
-                  User-selected mode
-                             │
-             ┌───────────────┼───────────────┐
-             ▼               ▼               ▼
-            RAM             LZ4             Zstd
-            RAW          compressed       compressed
+Recurso web
+    │
+    ▼
+bloques de 64 KiB
+    │
+    ▼
+hash BLAKE3
+    │
+    ▼
+búsqueda de candidatos
+    │
+    ▼
+verificación byte a byte
+    │
+    ├── idéntico ──► reutilizar bloque
+    │
+    └── diferente ─► crear bloque
+                          │
+                          ▼
+                    referencias
+                          │
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+             HOT         WARM        COLD
+              │           │           │
+              └───────────┴───────────┘
+                          │
+                          ▼
+                  modo seleccionado
+                          │
+              ┌───────────┼───────────┐
+              ▼           ▼           ▼
+             RAW         LZ4         Zstd
 ```
 
-Temperature and physical storage are intentionally separate concepts.
+La temperatura lógica y el formato físico son conceptos independientes.
 
-A block can therefore be:
+Un bloque puede tener:
 
 ```text
-Temperature: COLD
-Storage:     RAW
+Temperatura: COLD
+Almacenamiento: RAW
 ```
 
-For example, this happens when compression is disabled or when compressing the block would not reduce its size.
+Esto ocurre cuando:
+
+- La compresión está desactivada.
+- El bloque no obtiene ahorro al comprimirse.
+- El algoritmo ya fue probado y rechazado para ese bloque.
 
 ---
 
-# Deduplication
+# Deduplicación
 
-Resources are split into 64 KiB blocks.
-
-Each block is hashed using BLAKE3:
+Cada recurso se divide en bloques de 64 KiB.
 
 ```text
-resource
-   │
-   ▼
-64 KiB blocks
-   │
-   ▼
+bloque
+  │
+  ▼
 BLAKE3
-   │
-   ▼
-candidate lookup
-   │
-   ▼
-byte comparison
-   │
-   ├── identical → reuse existing block
-   │
-   └── different → store new block
+  │
+  ▼
+índice de candidatos
+  │
+  ▼
+comparación de tamaño
+  │
+  ▼
+restauración verificada
+  │
+  ▼
+comparación byte a byte
 ```
 
-The hash is **not considered proof of equality**.
+El hash no se considera prueba suficiente de igualdad.
 
-Candidate blocks are compared byte-for-byte before deduplication occurs.
+Dos bloques solo se deduplican cuando:
+
+1. El hash BLAKE3 coincide.
+2. El tamaño original coincide.
+3. El contenido restaurado coincide byte a byte.
+
+Cuando se detecta un duplicado:
+
+- No se crea un nuevo bloque físico.
+- Se incrementa el contador de referencias.
+- Se registra la referencia del espacio de trabajo.
+- Se incrementa el contador de bloques duplicados.
 
 ---
 
-# Workspace isolation
+# Modelo térmico
 
-Every logical browser workspace maintains its own references.
-
-Conceptually:
-
-```text
-Workspace A ────────┐
-                    │
-Workspace B ────────┼──► shared resource block
-                    │
-Workspace C ────────┘
-```
-
-Closing or crashing one workspace should eventually only remove that workspace's references.
-
-Shared resources remain available while other workspaces still reference them.
-
-Full browser-level lifecycle management is not implemented yet.
-
----
-
-# Thermal model
-
-Blocks maintain an independent logical temperature:
+Los bloques tienen una temperatura lógica:
 
 ```text
 HOT
  │
- │ inactivity
+ │ inactividad
  ▼
 WARM
  │
- │ longer inactivity
+ │ más inactividad
  ▼
 COLD
 ```
 
-Accessing an inactive block promotes it back to HOT:
+Valores experimentales actuales:
 
 ```text
-COLD
- │
- │ access
- ▼
-decompress if necessary
- │
- ▼
-verify BLAKE3
- │
- ▼
-HOT
+WARM después de:       50 ticks
+COLD después de:      200 ticks
+Ciclo de aging:        25 recursos
 ```
 
-The current prototype uses logical ticks rather than wall-clock time.
-
-Default experimental thresholds:
+Los bloques nuevos entran como:
 
 ```text
-WARM after:      50 ticks
-COLD after:     200 ticks
-Aging interval:  25 ticks
+Temperatura: HOT
+Almacenamiento: RAW
 ```
 
-These values are experimental and are not recommendations for a production browser.
+Cuando envejecen:
 
-## Temperature vs storage
+- En modo RAM permanecen RAW.
+- En modo LZ4 intentan comprimirse con LZ4.
+- En modo Zstd intentan comprimirse con Zstd.
+- Si la compresión no reduce el tamaño, permanecen RAW.
 
-Temperature does **not** select the compression algorithm.
+---
 
-The user selects a global memory mode:
+# Aprendizaje de compresión
+
+No todos los recursos se benefician de la compresión.
+
+Ejemplos frecuentes:
+
+- Imágenes ya comprimidas.
+- Audio.
+- Vídeo.
+- Fuentes.
+- Binarios.
+- Algunos recursos cifrados o empaquetados.
+
+Proceso utilizado:
 
 ```text
-RAM
-LZ4
-Zstd
+bloque RAW
+    │
+    ▼
+comprimir
+    │
+    ▼
+¿comprimido < original?
+    │
+    ├── sí ──► almacenar comprimido
+    │
+    └── no ──► conservar RAW
+                    │
+                    ▼
+          recordar rechazo
 ```
 
-The engine independently decides whether a block is:
+Los bloques son inmutables en el modelo actual. Si un bloque no se beneficia de LZ4 o Zstd, el motor recuerda el resultado y evita gastar CPU repitiendo la misma prueba.
+
+---
+
+# Integración en vivo con CEF
+
+El repositorio contiene un navegador experimental basado en CEF 154 dentro de:
 
 ```text
-HOT
-WARM
-COLD
+browser/
 ```
 
-For example, in LZ4 mode:
+Flujo implementado:
 
 ```text
-HOT       → RAW
-WARM      → LZ4 when beneficial
-COLD      → LZ4 when beneficial
+respuesta de red de CEF
+        │
+        ▼
+ResourceRequestHandler
+        │
+        ▼
+ResponseFilter transparente
+        │
+        ├── reenvía los bytes a Chromium
+        │
+        └── captura una copia para Memora
+                    │
+                    ▼
+              respuesta completa
+                    │
+                    ▼
+              bloques de 64 KiB
+                    │
+                    ▼
+                 BLAKE3
+                    │
+                    ▼
+              deduplicación
+                    │
+                    ▼
+             envejecimiento
+                    │
+                    ▼
+              RAW / LZ4 / Zstd
 ```
 
-In Zstd mode:
+El filtro es pasante.
 
-```text
-HOT       → RAW
-WARM      → Zstd when beneficial
-COLD      → Zstd when beneficial
+Chromium recibe los mismos bytes mientras Memora conserva una copia para procesarla.
+
+Actualmente se almacenan únicamente respuestas que:
+
+- Finalizan correctamente.
+- Tienen un cuerpo no vacío.
+- Fueron capturadas por el `ResponseFilter`.
+
+Las respuestas vacías y las cargas fallidas no se insertan en el gestor.
+
+---
+
+## Componentes principales de la integración
+
+### `ResourceRequestHandler`
+
+Permite observar:
+
+- URL solicitada.
+- Inicio de la carga.
+- Respuesta HTTP.
+- MIME.
+- Código HTTP.
+- Finalización de la carga.
+
+### `ResponseFilter`
+
+Permite:
+
+- Recibir los fragmentos de respuesta.
+- Copiarlos sin modificación hacia Chromium.
+- Acumular una copia completa para Memora.
+- Informar correctamente los bytes consumidos y producidos.
+
+### `MemoryResource`
+
+Agrupa:
+
+```rust
+workspace
+url
+mime_type
+status
+body
 ```
 
-And in RAM mode:
+### `MemoryManager`
+
+Procesa el cuerpo capturado:
 
 ```text
-HOT       → RAW
-WARM      → RAW
-COLD      → RAW
+body
+  │
+  ▼
+chunks de 64 KiB
+  │
+  ▼
+BLAKE3
+  │
+  ▼
+deduplicación
+  │
+  ▼
+almacenamiento físico
 ```
 
 ---
 
-# Compression learning
+# Alcance actual del navegador
 
-Not every resource benefits from compression.
+## Implementado
 
-Already compressed formats, fonts, images, and other binary data may become larger when compressed again.
+- [x] CEF 154 integrado desde Rust.
+- [x] Ventana básica del navegador.
+- [x] Navegación por URL.
+- [x] Interceptación de recursos en vivo.
+- [x] Captura de respuestas mediante `ResponseFilter`.
+- [x] Copia transparente sin modificar los bytes de Chromium.
+- [x] Captura de URL, MIME, estado HTTP y cuerpo.
+- [x] Inserción de recursos completos en el gestor.
+- [x] División en bloques de 64 KiB.
+- [x] BLAKE3.
+- [x] Verificación byte a byte.
+- [x] Deduplicación real.
+- [x] Referencias lógicas.
+- [x] Modelo HOT, WARM y COLD.
+- [x] Integración con LZ4.
+- [x] Soporte del motor para Zstd.
+- [x] Métricas en vivo.
+- [x] Pruebas con navegación real.
+- [x] Pruebas con reproducción de vídeo.
 
-Monster Memory Engine therefore tests whether compression is actually useful:
+## Pendiente
 
-```text
-original block
-      │
-      ▼
-   compress
-      │
-      ▼
-compressed < original?
-     /               \
-   yes                no
-    │                  │
- store compressed    keep RAW
-                       │
-                       ▼
-                 remember result
-```
-
-Because resource blocks are immutable in the current model, a failed compression attempt does not need to be repeated.
-
-This prevents repeatedly spending CPU on blocks known to be incompressible.
+- [ ] Múltiples espacios de trabajo aislados.
+- [ ] Configuración RAM/LZ4/Zstd desde la interfaz.
+- [ ] Límite configurable de memoria.
+- [ ] Política de expulsión.
+- [ ] Liberación de bloques sin referencias.
+- [ ] Asociación completa entre recursos y pestañas.
+- [ ] Suspensión de pestañas inactivas.
+- [ ] Liberación real del renderer de Chromium.
+- [ ] Restauración de pestañas.
+- [ ] Comparación formal con Chromium sin modificar.
 
 ---
 
-# Current benchmark
+# Resultado observado con tráfico real
 
-The current test dataset contains resources captured from several web workspaces via HAR files.
-
-Multimedia responses such as video and audio are excluded from the resource benchmark.
-
-Dataset used during the current experiment:
+Durante una prueba intensiva se observó:
 
 ```text
-Logical content:       91.25 MiB
-Unique after dedupe:   58.58 MiB
-Deduplication saved:   32.67 MiB
-Deduplication ratio:   35.81 %
-
-Logical blocks:        1,751
-Unique blocks:         1,143
-Duplicate blocks:        608
-Block size:            64 KiB
+Resources: 2865
+Blocks: 1675 unique / 3652 logical
+Duplicates: 1977
+Logical: 64.34 MiB
+Physical: 23.91 MiB
 ```
 
-## Memory mode comparison
+Interpretación:
 
-Results from the same dataset and deterministic 20,000-access simulation:
+- `Resources`: respuestas completas insertadas.
+- `Logical blocks`: total de referencias lógicas recibidas.
+- `Unique blocks`: bloques físicos diferentes.
+- `Duplicates`: bloques reutilizados.
+- `Logical`: volumen total recibido por Memora.
+- `Physical`: bytes físicos almacenados por el gestor después de deduplicar y comprimir.
 
-| Mode         | Final managed memory | Total saving |
-| ------------ | -------------------: | -----------: |
-| RAM          |            58.58 MiB |       35.81% |
-| LZ4          |            25.71 MiB |       71.83% |
-| Zstd level 3 |            20.35 MiB |       77.70% |
-
-The RAM mode still benefits from deduplication but performs no compression.
-
-### Observed access latency
+En esa prueba:
 
 ```text
-RAW access       ~35-38 ns*
-LZ4 restore      ~34 µs
-Zstd restore     ~95 µs
+Bloques lógicos:   3652
+Bloques únicos:    1675
+Duplicados:        1977
 ```
 
-`*` RAW access measures the overhead of the simulation's direct-access path. It is **not a system memory bandwidth benchmark**.
-
-During the tested workload:
-
-```text
-RAM
-Final managed memory:  58.58 MiB
-
-LZ4
-Final managed memory:  25.71 MiB
-
-Zstd level 3
-Final managed memory:  20.35 MiB
-```
-
-The results illustrate the intended trade-off:
-
-```text
-                CPU / latency     Memory usage
-
-RAM               lowest           highest
-
-LZ4               medium           lower
-
-Zstd              highest          lowest
-```
+Esto demuestra que una parte importante del tráfico estaba formada por contenido repetido.
 
 > [!WARNING]
-> These numbers must not be interpreted as "Chromium uses 77% less RAM".
->
-> The current benchmark operates on captured web-resource bodies. It does not yet manage V8 heaps, Blink DOM state, decoded image surfaces, GPU resources, renderer allocations, or total Chromium process memory.
+> `Physical: 23.91 MiB` no significa que Chromium utilizara únicamente 23.91 MiB de RAM.
+
+Chromium continúa manteniendo por separado:
+
+- Procesos renderer.
+- Heap de JavaScript.
+- Estado de V8.
+- DOM de Blink.
+- Imágenes decodificadas.
+- Recursos GPU.
+- Buffers de audio y vídeo.
+- Cachés internas.
+- Estado de pestañas.
+- Memoria del proceso principal.
+- Procesos auxiliares.
+
+En una prueba agresiva, el conjunto de procesos CEF/Chromium llegó a consumir varios gigabytes mientras Memora administraba decenas de MiB.
+
+Esto confirma que la captura de recursos HTTP es solo una parte del problema.
 
 ---
 
-# Real-world resource observations
+# Próxima fase: ciclo de vida de pestañas
 
-In the current dataset, text-oriented resources responded particularly well to compression.
+La siguiente fase de investigación es conseguir que Chromium libere memoria de pestañas inactivas y utilice Memora como almacenamiento de respaldo.
 
-Examples include:
+Flujo conceptual:
 
-- HTML
-- JavaScript
-- CSS
-- JSON
+```text
+PESTAÑA ACTIVA
+      │
+      ▼
+PESTAÑA INACTIVA
+      │
+      ▼
+capturar estado recuperable
+      │
+      ▼
+almacenar mediante Memora
+      │
+      ▼
+suspender o descartar renderer
+      │
+      ▼
+liberar memoria real de Chromium
+      │
+      ▼
+usuario vuelve a la pestaña
+      │
+      ▼
+restaurar o reconstruir
+```
 
-Already compressed or binary resources generally showed considerably smaller gains, including some:
+La parte clave es:
 
-- Images
-- Fonts
-- Other binary resources
+> Capturar y comprimir recursos HTTP no hace que Chromium libere automáticamente sus propias copias ni el estado interno de la pestaña.
 
-The engine therefore makes compression decisions at block level instead of assuming that every resource should be compressed.
+Para reducir materialmente la RAM total será necesario investigar:
+
+- Detección de pestañas inactivas.
+- Freeze del renderer.
+- Descarte del renderer.
+- Serialización de estado recuperable.
+- Restauración de navegación.
+- Reconstrucción de la pestaña.
+- Restauración de formularios y scroll.
+- Manejo de sesiones.
+- Política de activación y descarte.
+- Medición de latencia de restauración.
 
 ---
 
-# Running the prototype
+# Benchmark original con HAR
 
-## Requirements
+El prototipo original utiliza recursos capturados mediante archivos HAR.
 
-- Rust
-- Cargo
-- On Windows: the MSVC Rust toolchain and corresponding C++ build tools
+Dataset utilizado:
 
-Build:
+```text
+Contenido lógico:           91.25 MiB
+Único tras deduplicación:   58.58 MiB
+Ahorro por deduplicación:   32.67 MiB
+Relación de deduplicación:  35.81 %
+Bloques lógicos:            1751
+Bloques únicos:             1143
+Bloques duplicados:          608
+Tamaño de bloque:           64 KiB
+```
 
-```bash
+## Comparación de modos
+
+| Modo         | Memoria física final | Ahorro total |
+| ------------ | -------------------: | -----------: |
+| RAM          |            58.58 MiB |      35.81 % |
+| LZ4          |            25.71 MiB |      71.83 % |
+| Zstd nivel 3 |            20.35 MiB |      77.70 % |
+
+Estos resultados corresponden al conjunto de recursos administrado por el prototipo.
+
+No significan que Chromium utilice un 77 % menos de RAM.
+
+## Latencia observada
+
+```text
+Acceso RAW:        ~35-38 ns
+Restauración LZ4:  ~34 µs
+Restauración Zstd: ~95 µs
+```
+
+El acceso RAW mide la ruta directa de la simulación. No es una prueba de ancho de banda de memoria del sistema.
+
+---
+
+# Ejecución del motor original
+
+## Requisitos
+
+- Rust.
+- Cargo.
+- En Windows, toolchain MSVC.
+- Herramientas de compilación de C++ correspondientes.
+
+Compilar:
+
+```powershell
 cargo build --release
 ```
 
----
+## Modo RAM
 
-## Capture directory
-
-Create:
-
-```text
-captures/
-```
-
-Place HAR files containing response bodies inside it:
-
-```text
-captures/
-├── workspace-1.har
-├── workspace-2.har
-├── workspace-3.har
-└── ...
-```
-
-Each HAR file is treated as an independent logical workspace.
-
-Invalid or truncated HAR files are skipped instead of terminating the complete experiment.
-
-Do **not** commit HAR files captured from private, authenticated, corporate, or sensitive websites.
-
----
-
-# RAM mode
-
-```bash
+```powershell
 cargo run --release -- ram
 ```
 
-Behavior:
+## Modo LZ4
 
-```text
-deduplication → yes
-compression   → no
-storage       → RAW
-```
-
----
-
-# LZ4 mode
-
-```bash
+```powershell
 cargo run --release -- lz4
 ```
 
-Behavior:
+## Modo Zstd
 
-```text
-deduplication → yes
-compression   → LZ4
-```
-
----
-
-# Zstd mode
-
-```bash
+```powershell
 cargo run --release -- zstd
 ```
 
-Default Zstd level:
+Nivel personalizado:
 
-```text
-3
-```
-
-Custom level:
-
-```bash
+```powershell
 cargo run --release -- zstd captures 5
 ```
 
 ---
 
-# Integrity verification
+# Ejecución del navegador CEF
 
-Every unique block retains its original BLAKE3 hash.
-
-After decompression:
+Desde:
 
 ```text
-compressed block
+C:\temp\rust\browser
+```
+
+Ejecutar:
+
+```powershell
+cargo run --bin memora-browser
+```
+
+La configuración actual del navegador utiliza LZ4 como modo predeterminado.
+
+Ejemplo de métricas:
+
+```text
+[Memora] Stored |
+Resources: 164 |
+Blocks: 362 unique / 394 logical |
+Duplicates: 32 |
+Logical: 16.55 MiB |
+Physical: 12.03 MiB
+```
+
+---
+
+# Integridad
+
+Cada bloque conserva su hash BLAKE3 original.
+
+Después de restaurar un bloque:
+
+```text
+bloque almacenado
        │
        ▼
-decompression
+descomprimir si corresponde
        │
        ▼
-restored bytes
+bytes restaurados
        │
        ▼
 BLAKE3
        │
        ▼
-compare with original hash
+comparar con hash original
 ```
 
-A successful run ends with:
-
-```text
-BLAKE3: OK
-```
+Si el hash no coincide, la restauración se considera inválida.
 
 ---
 
-# AI-assisted development
+# Privacidad
 
-Monster Memory Engine is a **human-driven, AI-assisted research and development project**.
+Las capturas HAR y los logs del navegador pueden contener:
 
-Generative AI has been used as a development tool during the evolution of the prototype, including:
+- URL privadas.
+- Parámetros de solicitud.
+- Tokens.
+- Datos de autenticación.
+- Respuestas de API.
+- Hostnames internos.
+- Información personal.
+- Recursos corporativos.
 
-- Exploring architectural approaches
-- Discussing browser memory-management strategies
-- Generating initial Rust implementations
-- Refactoring experimental code
-- Reviewing implementation ideas
-- Designing benchmark experiments
-- Analysing benchmark outputs
-- Identifying performance bottlenecks
-- Improving project documentation
+No deben subirse capturas privadas al repositorio.
 
-AI-generated suggestions are treated as engineering proposals, not as authoritative technical conclusions.
-
-The development process follows an iterative workflow:
-
-```text
-idea
- │
- ▼
-AI-assisted exploration
- │
- ▼
-implementation
- │
- ▼
-compile
- │
- ▼
-real execution
- │
- ▼
-benchmark
- │
- ▼
-analyse results
- │
- ▼
-correct / redesign
- │
- └────────────► repeat
-```
-
-The project's technical direction, experiments, execution, validation, and final implementation decisions remain human-driven.
-
-Generated or AI-assisted code is reviewed, compiled, executed, and iteratively validated before being incorporated into the prototype.
-
-In particular, claims involving:
-
-- Chromium internals
-- V8
-- Blink
-- Browser security boundaries
-- Memory-management behaviour
-- Performance characteristics
-
-should be validated experimentally or against authoritative technical documentation before being considered reliable.
-
-AI assistance is part of the development process, not part of the runtime architecture of the current memory engine.
-
----
-
-# Development history
-
-The prototype evolved incrementally.
-
-```text
-v0.1
-Synthetic deduplication + LZ4/Zstd benchmark
-
-v0.2
-Real JS/CSS/HTML/JSON/image/font resources
-
-v0.3
-HAR-based browser resource ingestion
-
-v0.4
-Shared resource store and workspace reference analysis
-
-v0.5
-HOT/WARM/COLD memory model
-
-v0.6
-Dynamic access simulation
-
-v0.6.1
-Compression-result learning and optimized HOT access
-
-v0.7
-User-selectable RAM/LZ4/Zstd memory modes
-Temperature separated from physical storage codec
-```
-
----
-
-# Current limitations
-
-The project currently operates as a **userspace simulation over captured browser resources**.
-
-It does not currently:
-
-- Embed Chromium or CEF
-- Intercept browser resources live
-- Replace Chromium's memory allocator
-- Compress arbitrary V8 heap pages
-- Deduplicate mutable DOM/runtime state
-- Manage GPU memory
-- Provide transparent virtual-memory paging
-- Implement true OS-level zram behavior
-- Provide copy-on-write memory pages
-- Measure complete browser RSS/working set
-- Provide production-grade browser security boundaries
-
-The prototype intentionally focuses on validating the memory-management model before attempting deep browser integration.
-
----
-
-# Roadmap
-
-## Stage 1: Memory engine
-
-- [x] Block-based resource storage
-- [x] BLAKE3 deduplication
-- [x] Byte-level collision verification
-- [x] Cross-workspace references
-- [x] HOT / WARM / COLD tracking
-- [x] LZ4 compression
-- [x] Zstd compression
-- [x] Compression usefulness detection
-- [x] Compression-result learning
-- [x] On-demand decompression
-- [x] Integrity verification
-- [x] RAM / LZ4 / Zstd user modes
-- [x] Dynamic workload simulation
-
-## Stage 2: Chromium browser prototype
-
-- [ ] Embed Chromium/CEF from Rust
-- [ ] Basic browser window
-- [ ] URL navigation
-- [ ] Multiple isolated workspaces
-- [ ] Live resource interception
-- [ ] Replace HAR input with live browser resources
-- [ ] Connect live resources to the shared resource store
-- [ ] Expose RAM / LZ4 / Zstd selection through browser settings
-
-## Stage 3: Browser memory research
-
-- [ ] Measure total browser working set
-- [ ] Compare against unmodified Chromium
-- [ ] Track resource lifetime per workspace
-- [ ] Release resources when reference count reaches zero
-- [ ] Investigate decoded image sharing
-- [ ] Investigate JavaScript/WASM resource sharing
-- [ ] Measure CPU cost under realistic browsing workloads
-- [ ] Measure workspace restoration latency
-- [ ] Benchmark different processor classes
-
-## Stage 4: Deeper Chromium integration
-
-Depending on the results of the CEF prototype:
-
-```text
-CEF sufficient
-      │
-      └── continue using CEF
-
-or
-
-deeper control required
-      │
-      └── investigate a Chromium fork
-```
-
-Deep integration with Blink, V8, Chromium allocators, renderer memory, or GPU resources is intentionally considered a later research stage.
-
----
-
-# Security model
-
-Deduplicating physical storage must never imply sharing logical permissions.
-
-Two workspaces referencing the same immutable block should still behave as isolated browser contexts.
-
-The intended model is:
-
-```text
-Physical storage
-      │
-      └── may be shared
-
-Logical ownership
-      │
-      └── remains isolated
-```
-
-Future browser integration must preserve Chromium's origin isolation, sandboxing, process isolation, and other security boundaries.
-
----
-
-# Privacy
-
-HAR files may contain:
-
-- Private URLs
-- Request parameters
-- Authentication-related information
-- API responses
-- Internal hostnames
-- Personal data
-- Corporate resources
-
-For this reason, HAR files should **never be committed by default**.
-
-Recommended `.gitignore`:
+Configuración recomendada para `.gitignore`:
 
 ```gitignore
 /target/
 /captures/
 *.har
 
-# Editors / OS
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 ```
 
-Before publishing changes, check the staged content carefully:
+Antes de publicar cambios:
 
-```bash
+```powershell
 git status
 git diff --cached
 ```
 
-The repository should contain benchmark descriptions and aggregate measurements rather than private HAR captures.
+---
+
+# Seguridad
+
+Compartir almacenamiento físico no debe implicar compartir permisos lógicos.
+
+```text
+Almacenamiento físico
+        │
+        └── puede compartirse
+
+Propiedad lógica
+        │
+        └── debe permanecer aislada
+```
+
+La integración futura debe respetar:
+
+- Same-origin policy.
+- Site isolation.
+- Sandbox de Chromium.
+- Aislamiento de procesos.
+- Permisos por origen.
+- Sesiones independientes.
+- Datos privados por espacio de trabajo.
 
 ---
 
-# Project status
+# Limitaciones actuales
+
+El proyecto combina una simulación basada en HAR con un navegador CEF experimental.
+
+Actualmente no:
+
+- Sustituye el asignador de memoria de Chromium.
+- Comprime páginas arbitrarias del heap de V8.
+- Deduplica estado mutable del DOM.
+- Controla memoria GPU.
+- Implementa paginación virtual transparente.
+- Implementa zram real a nivel del sistema operativo.
+- Implementa páginas copy-on-write.
+- Mide automáticamente el working set completo del navegador.
+- Suspende automáticamente pestañas inactivas.
+- Restaura el estado completo de una pestaña.
+- Proporciona garantías de seguridad para producción.
+
+---
+
+# Roadmap
+
+## Etapa 1: motor de memoria
+
+- [x] Almacenamiento por bloques.
+- [x] Deduplicación BLAKE3.
+- [x] Verificación byte a byte.
+- [x] Referencias por espacio de trabajo.
+- [x] Estados HOT, WARM y COLD.
+- [x] Compresión LZ4.
+- [x] Compresión Zstd.
+- [x] Detección de utilidad de compresión.
+- [x] Aprendizaje de resultados.
+- [x] Descompresión bajo demanda.
+- [x] Verificación de integridad.
+- [x] Modos RAM, LZ4 y Zstd.
+- [x] Simulación dinámica.
+
+## Etapa 2: prototipo de navegador
+
+- [x] Integrar CEF desde Rust.
+- [x] Crear ventana básica.
+- [x] Navegación por URL.
+- [ ] Espacios de trabajo aislados.
+- [x] Interceptación de recursos en vivo.
+- [x] Captura mediante `ResponseFilter`.
+- [x] Conectar recursos vivos con el gestor.
+- [ ] Selección de RAM/LZ4/Zstd desde configuración.
+
+## Etapa 3: memoria de pestañas
+
+- [ ] Medir working set total.
+- [ ] Comparar con Chromium sin modificar.
+- [ ] Asociar recursos con pestañas.
+- [ ] Liberar referencias al cerrar pestañas.
+- [ ] Detectar pestañas inactivas.
+- [ ] Suspender o descartar renderers.
+- [ ] Conservar estado recuperable.
+- [ ] Restaurar pestañas.
+- [ ] Medir latencia de restauración.
+- [ ] Medir coste de CPU.
+- [ ] Probar diferentes clases de procesador.
+
+## Etapa 4: integración profunda
+
+Si CEF proporciona control suficiente:
+
+```text
+continuar con CEF
+```
+
+Si se necesita control de:
+
+- Blink.
+- V8.
+- Renderers.
+- Allocators.
+- GPU.
+- Decoded image cache.
+- Lifecycle interno.
+
+entonces podría ser necesario investigar un fork de Chromium.
+
+---
+
+# Historial
+
+```text
+v0.1
+Benchmark sintético de deduplicación y LZ4/Zstd
+
+v0.2
+Recursos reales JS, CSS, HTML, JSON, imágenes y fuentes
+
+v0.3
+Ingesta mediante HAR
+
+v0.4
+Almacén compartido y referencias por workspace
+
+v0.5
+Modelo HOT/WARM/COLD
+
+v0.6
+Simulación dinámica de accesos
+
+v0.6.1
+Aprendizaje de compresión y ruta HOT optimizada
+
+v0.7
+Modos RAM/LZ4/Zstd seleccionables
+Separación entre temperatura y códec físico
+
+v0.8
+Integración experimental con CEF 154
+Captura en vivo con ResourceRequestHandler
+ResponseFilter transparente
+Conexión con el motor de bloques
+Deduplicación sobre tráfico real
+Métricas de memoria administrada
+```
+
+---
+
+# Estado del proyecto
 
 **Experimental / Proof of Concept**
 
-The current memory engine demonstrates that:
+Actualmente el proyecto demuestra que:
 
-1. Web-resource blocks can be deduplicated across logical workspaces.
-2. Deduplication can coexist with workspace-level reference tracking.
-3. RAM mode can retain deduplication without introducing compression.
-4. LZ4 can provide a memory/latency trade-off.
-5. Zstd can provide more aggressive memory reduction at greater CPU cost.
-6. The memory strategy can be selected by the user according to available hardware.
-7. Logical resource temperature can remain independent from its physical storage codec.
-8. Blocks that do not benefit from compression can remain RAW.
-9. Compression failures can be remembered to avoid repeated CPU work.
-10. Compressed blocks can be restored and verified successfully using BLAKE3.
+- CEF puede capturar respuestas HTTP en vivo.
+- El filtro puede reenviar los bytes sin impedir la navegación.
+- Los cuerpos se pueden dividir en bloques.
+- Los bloques se pueden deduplicar con BLAKE3.
+- La deduplicación funciona sobre tráfico real.
+- Los bloques pueden envejecer.
+- LZ4 puede reducir el almacenamiento físico.
+- Zstd está disponible como estrategia del motor.
+- Los bloques incomprimibles pueden mantenerse RAW.
+- Los bloques restaurados pueden verificarse.
+- La memoria administrada por Memora puede medirse por separado.
 
-The next major milestone is replacing HAR-based simulation with a real Chromium/CEF browser prototype.
-
----
-
-# Disclaimer
-
-Monster Memory Engine is experimental research software.
-
-Current benchmarks are intended to evaluate the prototype's internal memory-management model. They should not be interpreted as production-browser performance claims.
-
-Results may vary significantly depending on:
-
-- Workload
-- Resource types
-- Resource duplication
-- CPU architecture
-- Compression mode
-- Zstd compression level
-- Block size
-- Access patterns
-
-The project should be considered experimental until measurements are performed against an actual Chromium-based browser implementation.
+El siguiente gran objetivo es investigar el ciclo de vida de pestañas inactivas para liberar memoria real de Chromium y restaurar la pestaña después.
 
 ---
 
-# License
+# Descargo de responsabilidad
 
-A license has not been selected yet.
+Monster Memory Engine es software experimental de investigación.
 
-Before accepting external contributions or distributing binaries, the project should define a license and review the licenses and redistribution requirements of its dependencies and future Chromium/CEF integration.
+Los resultados dependen de:
+
+- Tipo de carga.
+- Recursos utilizados.
+- Porcentaje de duplicación.
+- Arquitectura del procesador.
+- Modo de compresión.
+- Nivel de Zstd.
+- Tamaño del bloque.
+- Patrones de acceso.
+- Comportamiento de Chromium.
+- Comportamiento de los sitios web.
+
+Los resultados del gestor no deben interpretarse automáticamente como ahorro total de memoria del navegador.
+
+---
+
+# Licencia
+
+Todavía no se ha seleccionado una licencia.
+
+Antes de aceptar contribuciones externas o distribuir binarios deben revisarse:
+
+- La licencia del proyecto.
+- Las licencias de las dependencias.
+- Las condiciones de redistribución de CEF.
+- Las condiciones aplicables a Chromium.
